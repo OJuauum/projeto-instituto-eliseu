@@ -3,8 +3,14 @@ const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const logger = pino({ level: 'silent' });
 
-let currentMenus = {};        // controle de contexto por usuário
-let atendimentoHumano = {};   // controle de usuários em atendimento humano
+let currentMenus = {};
+let atendimentoHumano = {};
+
+let lastDisconnectTime = 0;
+let lastOnlineTime = 0;
+const IGNORE_AFTER_RECONNECT_MS = 5000;
+
+const respondedMsgIds = new Set();
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth');
@@ -12,25 +18,44 @@ async function startBot() {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, qr, lastDisconnect } = update;
+
     if (qr) qrcode.generate(qr, { small: true });
-    if (connection === 'open') console.log('✅ Bot conectado!');
+    if (connection === 'open') {
+      console.log('✅ Bot conectado!');
+      lastOnlineTime = Date.now();
+      lastMsgTimestampByUser = {};
+      respondedMsgIds.clear();
+    };
     if (connection === 'close') {
+      lastDisconnectTime = Date.now();
       const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
       if (shouldReconnect) startBot();
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
 
-    // Ignora mensagens sem conteúdo ou enviadas pelo próprio bot
     if (!msg.message || msg.key.fromMe) return;
 
-    // Bloqueia mensagens de grupos
     const sender = msg.key.remoteJid;
     if (sender.endsWith('@g.us')) return;
 
-    // Captura o texto da mensagem
+    if (respondedMsgIds.has(msg.key.id)) return;
+
+    const messageTimestamp = msg.messageTimestamp.low * 1000;
+
+    if (messageTimestamp < lastOnlineTime) {
+      console.log(`Ignorando mensagem antiga de ${sender} (timestamp: ${messageTimestamp})`);
+      return;
+    }
+
+    if (respondedMsgIds.has(msg.key.id)) {
+      return;
+    }
+
+    respondedMsgIds.add(msg.key.id);
+
     const text = msg.message.conversation
       || msg.message.extendedTextMessage?.text
       || msg.message.imageMessage?.caption
@@ -38,8 +63,8 @@ async function startBot() {
       || '';
 
     const input = text.trim();
-
     const response = getResponse(sender, input);
+
     if (response) {
       await sock.sendPresenceUpdate('composing', sender);
       await new Promise(r => setTimeout(r, Math.min(1000 + response.length * 20, 4000)));
@@ -54,17 +79,15 @@ async function startBot() {
 function getResponse(sender, text) {
   const input = text.trim().toLowerCase();
 
-  // Se usuário está em atendimento humano, só responde se digitar "voltar"
   if (atendimentoHumano[sender]) {
     if (input === 'voltar') {
       atendimentoHumano[sender] = false;
       currentMenus[sender] = 'main';
       return mainMenu();
     }
-    return null; // não responde para não atrapalhar o humano
+    return null;
   }
 
-  // Comando para transferir para atendimento humano
   if (input === 'atendimento humano' || input === 'falar com atendente') {
     atendimentoHumano[sender] = true;
     return `👩‍💼 Você será transferido para nosso atendimento humano. Por favor, aguarde que um atendente irá te responder.`;
@@ -72,7 +95,6 @@ function getResponse(sender, text) {
 
   const context = currentMenus[sender] || 'main';
 
-  // Reset para menu principal
   if (['menu', 'voltar'].includes(input)) {
     currentMenus[sender] = 'main';
     return mainMenu();
@@ -138,6 +160,7 @@ function getResponse(sender, text) {
   return mainMenu();
 }
 
+
 // ---------------- Menus ----------------
 function mainMenu() {
   return `🌟 Olá! Esse é o contato do INSTITUTO ELISEU 🌟
@@ -178,14 +201,15 @@ I. As castrações são realizadas com *anestesia injetável*. Por questões de 
 II. Para *gatos*, é obrigatório o uso de *caixa de transporte*:
 - Até *2 gatos filhotes* por caixa;
 - *1 gato adulto* por caixa;
-- Sem caixa apropriada, a castração **não será realizada**.\n
+- Sem caixa apropriada, a castração *não será realizada*.\n
 III. É obrigatório respeitar os *horários de agendamento* e o *local definido*. Atrasos não serão tolerados.\n
 IV. É permitido levar no máximo *3 animais por pessoa* no dia da castração.\n
 📝 Agora, precisamos de algumas informações:
 - 📍 *Cidade*;
 - 🏘️ *Bairro*;
 - 🐾 *Tipo de animal* (*Cão* ou *Gato*);
-- 🔢 *Quantidade* (*Machos* e *Fêmeas*);
+- 🔢 *Quantidade*;
+-  ⚥ *Sexo* (*Machos* ou/e *Fêmeas*);
 - 🐶 *Raça*.\n
 📩 Assim que possível, retornaremos o contato.\n
 Muito obrigado! Encaminhando para o atendimento...`;
@@ -193,10 +217,10 @@ Muito obrigado! Encaminhando para o atendimento...`;
 const msgVeterinario = () => `🐾 *Atendimento Veterinário Gratuito*\n
 O programa é destinado a animais de pessoas de baixa renda, que não têm condições de arcar com os custos de uma consulta veterinária.\n
 🔎 *Informações importantes:*
-1️⃣ O atendimento é feito *somente com agendamento prévio*;
-2️⃣ Damos prioridade a *casos de urgência ou emergência*, com animais *sem raça definida*, residentes da *Baixada Santista*;
-3️⃣ A aprovação do atendimento depende da avaliação da nossa *equipe técnica*;
-4️⃣ A continuidade do tratamento será definida pelo *veterinário responsável*.\n
+I. O atendimento é feito *somente com agendamento prévio*;
+II. Damos prioridade a *casos de urgência ou emergência*, com animais *sem raça definida*, residentes da *Baixada Santista*;
+III. A aprovação do atendimento depende da avaliação da nossa *equipe técnica*;
+IV. A continuidade do tratamento será definida pelo *veterinário responsável*.\n
 📩 Assim que possível, retornaremos seu contato.\n
 🙏 Agradecemos pela compreensão. Encaminhando para o atendimento...`;
 
@@ -207,18 +231,18 @@ Se você tem interesse em adotar, entre em contato com os nossos setores pelo Wh
 📱 *Adoção de Gatos:* (13) 99630-8071\n
 💡 *Dica:* Antes de enviar sua mensagem, confira as fotos e histórias dos nossos animais nas redes sociais. Eles estão esperando por uma nova família cheia de amor!\n
 🔗 *Redes Sociais:*  
-Instagram: [@institutoeliseu](https://www.instagram.com/institutoeliseu/)  
-Facebook: [Instituto Eliseu](https://www.facebook.com/institutoeliseuoficial/)\n
+Instagram: https://www.instagram.com/institutoeliseu/
+Facebook: https://www.facebook.com/institutoeliseuoficial/\n
 Agradecemos sua confiança e carinho! 💛\n
 Para voltar ao menu principal, digite *voltar*.`;
 
 const colaborador = () => `✨ *Tornar-se Colaborador*\n
 Obrigado pelo seu interesse em apoiar o *Instituto Eliseu*! Para se tornar um doador mensal, siga os passos abaixo:
 
-🔗 Preencha o formulário de doação: [Clique aqui](https://www.institutoeliseu.org.br/doacao)
+🔗 Preencha o formulário de doação: https://www.institutoeliseu.org.br/doacao
 
 💰 *Informações importantes:*  
-- Valor mínimo da doação: R$ 30,00  
+- Valor mínimo da doação: R$ 30  
 - O boleto será enviado por e-mail ou link via WhatsApp  
 - O cadastro é automático após o envio do formulário  
 
@@ -230,11 +254,11 @@ Para voltar ao menu principal, digite *voltar*.`;
 const contribuicao = () => `🔁 *Contribuição Eventual*\n
 Muito obrigado por considerar apoiar o *Instituto Eliseu*! Sua contribuição faz toda a diferença para nossos animais. 💛
 
-🏦 *Banco Itaú*  
+🏦 *Banco Itaú - 341*  
 Agência: 0610  
 Conta Corrente: 14295-2  
 
-🏦 *Caixa Econômica Federal*  
+🏦 *Caixa Econômica Federal - 104*  
 Agência: 4140  
 Conta Corrente: 002352-0  
 
@@ -283,6 +307,8 @@ Aceitamos doações de:
 Rua São Paulo, 120 – Vila Belmiro – Santos/SP  
 CEP 11075-330
 
+🗺️ *Como chegar:* https://www.google.com/maps?q=Rua+São+Paulo,+120,+Vila+Belmiro,+Santos
+
 🙏 A família *Instituto Eliseu* agradece sua generosidade!  
 
 Para voltar ao menu principal, digite *voltar*.`;
@@ -293,7 +319,9 @@ Aceitamos doações de materiais diversos que possam contribuir com o bem-estar 
 
 📍 *Local para entrega:*  
 Rua São Paulo, 120 – Vila Belmiro – Santos/SP  
-CEP 11075-330  
+CEP 11075-330 
+
+🗺️ *Como chegar:* https://www.google.com/maps?q=Rua+São+Paulo,+120,+Vila+Belmiro,+Santos
 
 Se não for possível entregar, você também pode doar para outra entidade que precise — seu gesto já é muito valioso para nós.  
 
@@ -326,7 +354,7 @@ const enderecoHorario = () => `📍 *Endereço e Horário de Atendimento*\n
 Rua São Paulo, 120 – Vila Belmiro  
 Santos/SP – CEP 11075-330
 
-🗺️ *Como chegar:* [Clique aqui para abrir no Google Maps](https://www.google.com/maps?q=Rua+São+Paulo,+120,+Vila+Belmiro,+Santos)
+🗺️ *Como chegar:* https://www.google.com/maps?q=Rua+São+Paulo,+120,+Vila+Belmiro,+Santos
 
 🕒 *Horários de Atendimento:*  
 - Segunda a sexta-feira: 08h às 17h  
